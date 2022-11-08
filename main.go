@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/url"
 	"os"
@@ -218,4 +219,25 @@ func main() {
 	time.Sleep(1 * time.Second)
 	fmt.Println("Certificate:", watcher.Certificate())
 	fmt.Println("Root:", watcher.Root())
+
+	// check the cert
+	roots := x509.NewCertPool()
+	ok := roots.AppendCertsFromPEM([]byte(watcher.Root()))
+	if !ok {
+		panic("failed to parse root certificate")
+	}
+	block, _ := pem.Decode([]byte(watcher.Certificate()))
+	if block == nil {
+		panic("failed to parse certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		panic("failed to parse certificate: " + err.Error())
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots: roots,
+	}); err != nil {
+		panic("failed to verify certificate: " + err.Error())
+	}
+	log.Printf("verification success")
 }
