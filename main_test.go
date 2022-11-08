@@ -5,10 +5,8 @@ import (
 	context "context"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -70,6 +68,7 @@ func (c *testCAHandler) WatchRoots(request *pbconnectca.WatchRootsRequest, strea
 			if err := writeCertificate(); err != nil {
 				return err
 			}
+		}
 	}
 }
 
@@ -92,11 +91,12 @@ func (c *testCAHandler) Sign(ctx context.Context, request *pbconnectca.SignReque
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	raw, err := base64.URLEncoding.DecodeString(request.Csr)
-	if err != nil {
-		return nil, err
+	raw, _ := pem.Decode([]byte(request.Csr))
+	if raw == nil {
+		return nil, errors.New("invalid block")
 	}
-	csr, err := x509.ParseCertificateRequest(raw)
+
+	csr, err := x509.ParseCertificateRequest(raw.Bytes)
 	if err != nil {
 		return nil, err
 	}

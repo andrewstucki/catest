@@ -6,15 +6,20 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"math"
 	"net/url"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/consul/proto-public/pbconnectca"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type CertWatcher struct {
@@ -92,7 +97,8 @@ func (w *CertWatcher) watchRoots(ctx context.Context, rotatedRootCh chan *pbconn
 
 func (w *CertWatcher) watchCerts(ctx context.Context, rotatedRootCh chan *pbconnectca.WatchRootsResponse) error {
 	var err error
-	expiration := time.Duration(0)
+	// make sure we trigger the root fetch first
+	expiration := time.Duration(math.MaxInt64)
 
 	for {
 		select {
@@ -129,8 +135,12 @@ func (w *CertWatcher) fetchCert(ctx context.Context) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
+	data := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csr,
+	})
 	response, err := w.client.Sign(ctx, &pbconnectca.SignRequest{
-		Csr: base64.URLEncoding.EncodeToString(csr),
+		Csr: string(data),
 	})
 	if err != nil {
 		return 0, err
@@ -184,4 +194,28 @@ func getRoot(response *pbconnectca.WatchRootsResponse) *pbconnectca.CARoot {
 	return nil
 }
 
-func main() {}
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, "localhost:8502", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		panic(err)
+	}
+	client := pbconnectca.NewConnectCAServiceClient(conn)
+
+	watcher := NewCertWatcher("/ns/default/dc/dc1/svc/test", client)
+	go func() {
+		if err := watcher.Watch(ctx); err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				panic(err)
+			}
+		}
+	}()
+
+	time.Sleep(1 * time.Second)
+	fmt.Println("Certificate:", watcher.Certificate())
+	fmt.Println("Root:", watcher.Root())
+}
