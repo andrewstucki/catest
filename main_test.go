@@ -1,12 +1,20 @@
 package main
 
 import (
+	"bytes"
 	context "context"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,22 +26,119 @@ import (
 )
 
 type testCAHandler struct {
-	watchRoots func(request *pbconnectca.WatchRootsRequest, stream pbconnectca.ConnectCAService_WatchRootsServer) error
-	sign       func(ctx context.Context, request *pbconnectca.SignRequest) (*pbconnectca.SignResponse, error)
+	ca     *CertificateInfo
+	rotate chan struct{}
+
+	mutex sync.RWMutex
+}
+
+func newHandler() *testCAHandler {
+	return &testCAHandler{
+		ca:     DefaultTestCA,
+		rotate: make(chan struct{}),
+	}
 }
 
 func (c *testCAHandler) WatchRoots(request *pbconnectca.WatchRootsRequest, stream pbconnectca.ConnectCAService_WatchRootsServer) error {
-	if c.watchRoots == nil {
-		return errors.New("unimplemented")
+	writeCertificate := func() error {
+		c.mutex.RLock()
+		ca := string(c.ca.CertBytes)
+		c.mutex.RUnlock()
+
+		if err := stream.Send(&pbconnectca.WatchRootsResponse{
+			ActiveRootId: "test",
+			Roots: []*pbconnectca.CARoot{{
+				Id:       "test",
+				RootCert: ca,
+			}},
+		}); err != nil {
+			return err
+		}
+		return nil
 	}
-	return c.watchRoots(request, stream)
+
+	// do initial write
+	if err := writeCertificate(); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-c.rotate:
+			if err := writeCertificate(); err != nil {
+				return err
+			}
+	}
+}
+
+func (c *testCAHandler) Rotate() {
+	rootCA, err := GenerateSignedCertificate(GenerateCertificateOptions{
+		IsCA: true,
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	c.mutex.Lock()
+	c.ca = rootCA
+	c.mutex.Unlock()
+
+	c.rotate <- struct{}{}
 }
 
 func (c *testCAHandler) Sign(ctx context.Context, request *pbconnectca.SignRequest) (*pbconnectca.SignResponse, error) {
-	if c.sign == nil {
-		return nil, errors.New("unimplemented")
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	raw, err := base64.URLEncoding.DecodeString(request.Csr)
+	if err != nil {
+		return nil, err
 	}
-	return c.sign(ctx, request)
+	csr, err := x509.ParseCertificateRequest(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	template := x509.Certificate{
+		Signature:          csr.Signature,
+		SignatureAlgorithm: csr.SignatureAlgorithm,
+
+		PublicKeyAlgorithm: csr.PublicKeyAlgorithm,
+		PublicKey:          csr.PublicKey,
+
+		SerialNumber: serialNumber,
+		Issuer:       c.ca.Cert.Subject,
+		Subject:      csr.Subject,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+	}
+
+	certData, err := x509.CreateCertificate(rand.Reader, &template, c.ca.Cert, template.PublicKey, c.ca.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var certificatePEM bytes.Buffer
+	if err := pem.Encode(&certificatePEM, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certData,
+	}); err != nil {
+		return nil, err
+	}
+
+	return &pbconnectca.SignResponse{
+		CertPem: certificatePEM.String(),
+	}, nil
 }
 
 func retryRequest(retry func(ctx context.Context) error) error {
@@ -119,29 +224,42 @@ func runTestServer(t *testing.T, handler *testCAHandler, callback func(ctx conte
 	return nil
 }
 
-func TestCAExample(t *testing.T) {
-	for _, tt := range []struct {
-		name     string
-		handler  *testCAHandler
-		callback func(ctx context.Context, client pbconnectca.ConnectCAServiceClient)
-	}{
-		{
-			name: "foo bar",
-			handler: &testCAHandler{
-				sign: func(ctx context.Context, request *pbconnectca.SignRequest) (*pbconnectca.SignResponse, error) {
-					return nil, errors.New("foo bar")
-				},
-			},
-			callback: func(ctx context.Context, client pbconnectca.ConnectCAServiceClient) {
-				_, err := client.Sign(ctx, &pbconnectca.SignRequest{
-					Csr: "something here",
-				})
-				require.Equal(t, "foo bar", grpc.ErrorDesc(err))
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			require.NoError(t, runTestServer(t, tt.handler, tt.callback))
-		})
-	}
+func TestWatcher(t *testing.T) {
+	handler := newHandler()
+
+	runTestServer(t, handler, func(ctx context.Context, client pbconnectca.ConnectCAServiceClient) {
+		watcher := NewCertWatcher("/ns/default/dc/testing/svc/test-service", client)
+		require.Equal(t, "", watcher.Root())
+		require.Equal(t, "", watcher.Certificate())
+
+		done := make(chan error, 1)
+		go func() {
+			done <- watcher.Watch(ctx)
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+		firstRoot := watcher.Root()
+		firstCert := watcher.Certificate()
+
+		require.NotEqual(t, "", firstRoot)
+		require.NotEqual(t, "", firstCert)
+
+		handler.Rotate()
+
+		time.Sleep(100 * time.Millisecond)
+		secondRoot := watcher.Root()
+		secondCert := watcher.Certificate()
+
+		require.NotEqual(t, "", secondRoot)
+		require.NotEqual(t, "", secondCert)
+		require.NotEqual(t, firstRoot, secondRoot)
+		require.NotEqual(t, firstCert, secondCert)
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-ctx.Done():
+		default:
+		}
+	})
 }
